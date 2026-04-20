@@ -1,0 +1,5 @@
+Failed to connect to host %s on port %d
+Data size exceeds maximum limit of %zu bytes
+Unexpected error: %s
+System startup sequence completed in %f seconds
+%s: %s occurred at %s

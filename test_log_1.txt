@@ -1,0 +1,5 @@
+Failed to connect to host %s on port %d
+Timeout occurred while waiting for response from %s
+Invalid parameter %zu received in function %s
+Error processing file %s: %s
+User %s successfully logged in at %s
