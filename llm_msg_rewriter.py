@@ -18,15 +18,15 @@ logger = logging.getLogger(__name__)
 @dataclass
 class LLMConfig:
     """LLM模型服务配置类"""
-    api_key: Optional[str] = "sk-898f757847b0461da3d48***********"
+    api_key: Optional[str] = "sk-7263afe43d0644c8adc30***********"
     base_url: str = "https://api.deepseek.com/v1/chat/completions"
     model: str = "deepseek-chat"
     temperature: float = 0.1  # 低温度保证改写精准，不跑偏
     top_p: float = 0.3
     repetition_penalty: float = 1.0
-    max_tokens: int = 2048
-    timeout: int = 60
-    max_retry: int = 3  # 接口失败自动重试
+    max_tokens: int = 5120  # DeepSeek 最大输出 token 为 5120
+    timeout: int = 180
+    max_retry: int = 5  # 接口失败自动重试
 
 @dataclass
 class ProcessConfig:
@@ -66,6 +66,9 @@ class LLMChatClient:
                     json=payload,
                     timeout=self.config.timeout
                 )
+                if resp.status_code != 200:
+                    logger.warning(f"LLM请求失败 (Status {resp.status_code})，响应内容：{resp.text}")
+                
                 resp.raise_for_status()
                 return resp.json()["choices"][0]["message"]["content"].strip()
             except Exception as e:
@@ -75,6 +78,43 @@ class LLMChatClient:
                     return None
         return None
 
+    def _preprocess_json(self, s: str) -> str:
+        """预处理 JSON 字符串，修复 LLM 常见的语法错误"""
+        if not s:
+            return s
+        
+        # 1. 修复非法的单引号转义 \'。
+        # JSON 不支持 \'，但支持 \\' (即转义后的反斜杠加单引号)。
+        # 我们将 \' 替换为 \\'，这样 json.loads 既能解析成功，又能保留原始文本中的 \'。
+        s = s.replace(r"\'", r"\\'")
+        
+        # 2. 移除可能的尾随逗号 (例如 {"a": 1,})
+        s = re.sub(r',\s*([\]}])', r'\1', s)
+        return s.strip()
+
+    def _extract_json(self, s: str) -> Optional[Dict]:
+        """从杂乱字符串中提取第一个合法的 JSON 对象"""
+        # 尝试所有可能的 { 起始位置
+        for i in range(len(s)):
+            if s[i] == '{':
+                # 尝试从该位置开始解析
+                try:
+                    # 使用 raw_decode 提取第一个完整的 JSON 对象
+                    decoder = json.JSONDecoder()
+                    obj, end_idx = decoder.raw_decode(s[i:])
+                    return obj
+                except json.JSONDecodeError:
+                    continue
+        return None
+
+    def _log_failure(self, text_batch: List[str], error: str, raw_output: str):
+        """记录解析失败的批次原始文本，仅包含行内容，批次间空行区分"""
+        log_file = "rewrite_failures.log"
+        with open(log_file, "a", encoding="utf-8") as f:
+            for line in text_batch:
+                f.write(line + "\n")
+            f.write("\n") # 批次间空行
+
     def batch_rewrite_lines(self, text_batch: List[str]) -> Optional[Dict[str, str]]:
         """批量同义改写，严格保留%s/%zu等格式符"""
         prompt = self._build_standard_prompt(text_batch)
@@ -82,31 +122,86 @@ class LLMChatClient:
         result = self._send_request(messages)
         
         if not result:
+            self._log_failure(text_batch, "API Request Failed (No Result)", "N/A")
             return None
         
-        # 解析JSON结果，兼容LLM输出格式
+        # 1. 过滤掉 <think>...</think> 标签内容（适配 DeepSeek-R1 等模型）
+        result_no_think = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL).strip()
+        
+        # 2. 先进行通用的文本预处理（修复转义等）
+        preprocessed_result = self._preprocess_json(result_no_think)
+        
+        # 2. 尝试提取 JSON
         try:
-            # 清理可能的markdown包裹，纯解析JSON
-            result = result.strip().strip("```json").strip("```")
-            return json.loads(result)
-        except json.JSONDecodeError:
-            logger.error(f"JSON解析失败，模型输出：{result}")
+            # 策略 A: 直接解析
+            return json.loads(preprocessed_result)
+        except json.JSONDecodeError as e:
+            # 策略 B: 从杂乱文本中寻找合法的 JSON 块
+            brace_indices = [m.start() for m in re.finditer('{', preprocessed_result)]
+            for idx in reversed(brace_indices):
+                try:
+                    decoder = json.JSONDecoder()
+                    obj, _ = decoder.raw_decode(preprocessed_result[idx:])
+                    if isinstance(obj, dict) and len(obj) > 0:
+                        return obj
+                except (json.JSONDecodeError, ValueError):
+                    continue
+            
+            # 策略 C: 激进清理后提取
+            clean_result = re.sub(r"```(?:json)?\s*(.*?)\s*```", r"\1", preprocessed_result, flags=re.DOTALL)
+            if clean_result != preprocessed_result:
+                res = self.batch_rewrite_lines_from_clean(clean_result)
+                if res: return res
+            
+            # 记录失败详情
+            self._log_failure(text_batch, str(e), result)
+            logger.error(f"JSON解析最终失败，详情已记录至 rewrite_failures.log")
             return None
+
+    def batch_rewrite_lines_from_clean(self, clean_text: str) -> Optional[Dict[str, str]]:
+        """从清洗后的文本中再次尝试解析"""
+        try:
+            return json.loads(clean_text)
+        except json.JSONDecodeError:
+            # 重复一次策略 B 的逻辑
+            brace_indices = [m.start() for m in re.finditer('{', clean_text)]
+            for idx in reversed(brace_indices):
+                try:
+                    decoder = json.JSONDecoder()
+                    obj, _ = decoder.raw_decode(clean_text[idx:])
+                    if isinstance(obj, dict): return obj
+                except: continue
+        return None
 
     @staticmethod
     def _build_standard_prompt(text_list: List[str]) -> str:
-        """强约束提示词，100%满足你的改写要求"""
+        """Strongly constrained prompt in English to prevent character loss and Chinese output."""
         line_list = "\n".join([f"{i+1}. {line}" for i, line in enumerate(text_list)])
         return f"""
-任务：对以下英文日志文本做**同义改写**，严格遵守所有规则：
-1. 必须完整保留所有C/C++格式符：%s、%d、%zu、%f等，不修改、不丢失，且顺序保持一致
-2. 仅调整连接词、句式，保留核心词汇，语义完全不变
-3. 双引号、转义字符完全保留
-4. 输出**仅返回标准JSON字典**，无任何多余文字：key=原始行，value=改写行
-5. 严格使用双引号，禁止单引号，禁止markdown
+Task: Perform synonym rewriting for the following English log messages.
 
-待改写文本：
+Rules (Must be strictly followed):
+1. **Preserve All Characters**: You MUST preserve every single character from the original message that is not part of the synonym change. This includes all leading/trailing quotation marks ("), periods, spaces, and punctuation. If the original message is enclosed in quotes, the rewritten message MUST also be enclosed in quotes.
+2. **Keep Format Specifiers**: You must preserve all C/C++ format specifiers (e.g., %s, %d, %zu, %f) exactly. Do not modify, remove, or change their order.
+3. **Language Consistency**: The output MUST be in **English**. Do not translate to Chinese or any other language.
+4. **Semantic Integrity**: Only adjust sentence structures or conjunctions. Keep core technical terms unchanged to ensure 100% semantic consistency.
+5. **JSON Output Only**: 
+   - Return ONLY a standard JSON dictionary.
+   - Keys must be the EXACT original lines (including any quotes), and values must be the rewritten lines (including any quotes).
+   - Use double quotes for JSON keys and values. Escape internal double quotes with a backslash (\\").
+   - Do NOT escape single quotes (do not use \\').
+
+Input Messages:
 {line_list}
+
+Example Output:
+{{
+  "\\"original message with %s\\"": "\\"rewritten message with %s\\"",
+  "\\"original message for \\'kernel undefined\\' error.\\"": "\\"rewritten message for \\'kernel undefined\\' error.\\"",
+  "regular message": "rewritten message"
+}}
+
+Output the JSON directly:
 """
 
 # ====================== 3. 通用文件处理器（可复用资产） ======================
@@ -117,14 +212,29 @@ class FileTextProcessor:
         self.format_re = re.compile(r"%[sdzufl]")  # 匹配所有C格式占位符
 
     def load_all_lines(self, file_paths: List[str]) -> List[str]:
-        """读取多个文件，合并所有非空行"""
+        """读取多个文件，合并所有非空行，并过滤掉单单词行"""
         all_lines = []
         for fp in file_paths:
             try:
                 with open(fp, "r", encoding=self.config.file_encoding) as f:
-                    lines = [line.strip() for line in f if line.strip()]
+                    # 过滤逻辑：1. 非空 2. 单词数 > 1
+                    lines = []
+                    for line in f:
+                        clean_line = line.strip()
+                        if not clean_line:
+                            continue
+                        
+                        # 判定是否为单单词：去掉首尾引号后，检查是否有空格
+                        # 例如 "gmnodes" -> gmnodes (无空格，跳过)
+                        # 例如 "bad cast" -> bad cast (有空格，保留)
+                        content = clean_line.strip('"').strip("'").strip()
+                        if " " not in content:
+                            continue
+                            
+                        lines.append(clean_line)
+                    
                     all_lines += lines
-                    logger.info(f"文件{fp}读取完成，行数：{len(lines)}")
+                    logger.info(f"文件{fp}读取完成，有效行数：{len(lines)}")
             except Exception as e:
                 logger.error(f"文件{fp}读取失败：{str(e)}")
         return self._deduplicate(all_lines)
@@ -251,7 +361,7 @@ def run_rewrite_task(file_paths: List[str], llm_cfg: Optional[LLMConfig] = None)
 if __name__ == "__main__":
     # 配置 1: DeepSeek (云端)
     deepseek_config = LLMConfig(
-        api_key="sk-898f757847b0461da3d48***********",
+        api_key="sk-7263afe43d0644c8adc30***********",
         base_url="https://api.deepseek.com/v1/chat/completions",
         model="deepseek-chat"
     )
@@ -266,11 +376,11 @@ if __name__ == "__main__":
     # 待处理文件
     TARGET_FILES = [
         "test_log_1.txt",
-        "test_log_2.txt"
+        # "test_log_2.txt"
     ]
 
     # 选择使用的配置（切换此处即可）
-    # current_config = deepseek_config
-    current_config = local_llm_config
+    current_config = deepseek_config
+    # current_config = local_llm_config
 
     final_r_dict, fail_lines = run_rewrite_task(TARGET_FILES, current_config)
