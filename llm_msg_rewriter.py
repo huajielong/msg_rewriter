@@ -25,7 +25,7 @@ class LLMConfig:
     top_p: float = 0.3
     repetition_penalty: float = 1.0
     max_tokens: int = 5120  # DeepSeek 最大输出 token 为 5120
-    timeout: int = 180
+    timeout: int = 120
     max_retry: int = 5  # 接口失败自动重试
 
 @dataclass
@@ -181,11 +181,14 @@ class LLMChatClient:
 Task: Perform synonym rewriting for the following English log messages.
 
 Rules (Must be strictly followed):
-1. **Preserve All Characters**: You MUST preserve every single character from the original message that is not part of the synonym change. This includes all leading/trailing quotation marks ("), periods, spaces, and punctuation. If the original message is enclosed in quotes, the rewritten message MUST also be enclosed in quotes.
+
+1. **Preserve All Characters**: You MUST preserve all punctuation, spaces, leading/trailing quotation marks ("), and C/C++ format specifier characters from the original text. Characters involved in synonym replacement, word addition/deletion, article/pronoun adjustment and sentence structure fine-tuning are excluded from this preservation rule. If the original message is enclosed in quotes, the rewritten message MUST also be enclosed in quotes.
 2. **Keep Format Specifiers**: You must preserve all C/C++ format specifiers (e.g., %s, %d, %zu, %f) exactly. Do not modify, remove, or change their order.
 3. **Language Consistency**: The output MUST be in **English**. Do not translate to Chinese or any other language.
-4. **Semantic Integrity**: Only adjust sentence structures or conjunctions. Keep core technical terms unchanged to ensure 100% semantic consistency.
-5. **JSON Output Only**: 
+4. **Semantic Integrity**: Synonym replacement is permitted. You may fine-tune sentence structures, word order, and adjust connecting words. Core technical terms must remain unchanged to guarantee 100% semantic consistency.
+5. **Word Modification Scope**: Articles (a, an, the) and pronouns can be appropriately added or removed. You are only allowed to add, delete or replace connecting & transitional words, adjust sentence structures and word order, and perform authorized synonym replacement on non-core common words, without altering the original overall meaning.
+6. **Necessary Text Difference**: You MUST ensure that there are slight differences between the original text and the rewritten text. The result is strictly forbidden to be completely identical to the original content.
+7. **JSON Output Only**:
    - Return ONLY a standard JSON dictionary.
    - Keys must be the EXACT original lines (including any quotes), and values must be the rewritten lines (including any quotes).
    - Use double quotes for JSON keys and values. Escape internal double quotes with a backslash (\\").
@@ -209,7 +212,7 @@ class FileTextProcessor:
     """批量文件读取、行去重、分块、格式符校验"""
     def __init__(self, config: ProcessConfig):
         self.config = config
-        self.format_re = re.compile(r"%[sdzufl]")  # 匹配所有C格式占位符
+        self.format_re = re.compile(r'%[-+ #0]*(\d+|\*)?(\.(\d+|\*))?([hlLjzt]|ll|hh)?[diufFeEgGxXoscpaAn]')  # 匹配所有C/C++格式占位符
 
     def load_all_lines(self, file_paths: List[str]) -> List[str]:
         """读取多个文件，合并所有非空行，并过滤掉单单词行"""
@@ -223,12 +226,15 @@ class FileTextProcessor:
                         clean_line = line.strip()
                         if not clean_line:
                             continue
+
+                        content = clean_line.strip('"').strip("'").strip()                        
+                        # 先去除 C 格式占位符 (如 %s, %d)，并去空格避免其占用的字母被误判为单词
+                        content = self.format_re.sub(" ", content).strip()
                         
-                        # 判定是否为单单词：去掉首尾引号后，检查是否有空格
-                        # 例如 "gmnodes" -> gmnodes (无空格，跳过)
-                        # 例如 "bad cast" -> bad cast (有空格，保留)
-                        content = clean_line.strip('"').strip("'").strip()
-                        if " " not in content:
+                        # 判定是否为单单词：使用正则匹配所有单词，若单词数 <= 2 则跳过
+                        # 这样可以处理多个空格、制表符等情况
+                        reg = r'[a-zA-Z]+(?:[_:\-\.>a-zA-Z]+)*'
+                        if len(re.findall(reg, content)) <= 2:
                             continue
                             
                         lines.append(clean_line)
@@ -361,7 +367,7 @@ def run_rewrite_task(file_paths: List[str], llm_cfg: Optional[LLMConfig] = None)
 if __name__ == "__main__":
     # 配置 1: DeepSeek (云端)
     deepseek_config = LLMConfig(
-        api_key="sk-7263afe43d0644c8adc30***********",
+        api_key="sk-2a334db655c742d68ad71af0a42d1eb6",
         base_url="https://api.deepseek.com/v1/chat/completions",
         model="deepseek-chat"
     )
