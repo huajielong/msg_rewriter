@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 import requests
+from json_repair import repair_json
 
 # ====================== 全局日志配置（可复用资产） ======================
 logging.basicConfig(
@@ -78,35 +79,6 @@ class LLMChatClient:
                     return None
         return None
 
-    def _preprocess_json(self, s: str) -> str:
-        """预处理 JSON 字符串，修复 LLM 常见的语法错误"""
-        if not s:
-            return s
-        
-        # 1. 修复非法的单引号转义 \'。
-        # JSON 不支持 \'，但支持 \\' (即转义后的反斜杠加单引号)。
-        # 我们将 \' 替换为 \\'，这样 json.loads 既能解析成功，又能保留原始文本中的 \'。
-        s = s.replace(r"\'", r"\\'")
-        
-        # 2. 移除可能的尾随逗号 (例如 {"a": 1,})
-        s = re.sub(r',\s*([\]}])', r'\1', s)
-        return s.strip()
-
-    def _extract_json(self, s: str) -> Optional[Dict]:
-        """从杂乱字符串中提取第一个合法的 JSON 对象"""
-        # 尝试所有可能的 { 起始位置
-        for i in range(len(s)):
-            if s[i] == '{':
-                # 尝试从该位置开始解析
-                try:
-                    # 使用 raw_decode 提取第一个完整的 JSON 对象
-                    decoder = json.JSONDecoder()
-                    obj, end_idx = decoder.raw_decode(s[i:])
-                    return obj
-                except json.JSONDecodeError:
-                    continue
-        return None
-
     def _log_failure(self, text_batch: List[str], error: str, raw_output: str):
         """记录解析失败的批次原始文本，仅包含行内容，批次间空行区分"""
         log_file = "rewrite_failures.log"
@@ -128,49 +100,26 @@ class LLMChatClient:
         # 1. 过滤掉 <think>...</think> 标签内容（适配 DeepSeek-R1 等模型）
         result_no_think = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL).strip()
         
-        # 2. 先进行通用的文本预处理（修复转义等）
-        preprocessed_result = self._preprocess_json(result_no_think)
+        # 2. 预处理：修复 LLM 偶尔在 JSON 字符串内部末尾多加的逗号
+        # 例如将 "rewritten text," 修复为 "rewritten text"
+        # 逻辑：匹配引号前面的逗号，且该引号后面紧跟着换行、逗号或 JSON 结束符
+        result_no_think = re.sub(r'([^\\]),"(\s*[,\}\n])', r'\1"\2', result_no_think)
         
-        # 2. 尝试提取 JSON
+        # 3. 使用 json_repair 自动修复并解析 JSON
         try:
-            # 策略 A: 直接解析
-            return json.loads(preprocessed_result)
-        except json.JSONDecodeError as e:
-            # 策略 B: 从杂乱文本中寻找合法的 JSON 块
-            brace_indices = [m.start() for m in re.finditer('{', preprocessed_result)]
-            for idx in reversed(brace_indices):
-                try:
-                    decoder = json.JSONDecoder()
-                    obj, _ = decoder.raw_decode(preprocessed_result[idx:])
-                    if isinstance(obj, dict) and len(obj) > 0:
-                        return obj
-                except (json.JSONDecodeError, ValueError):
-                    continue
+            # repair_json() 能处理 Markdown 代码块、缺失括号、非标准转义等多种错误
+            repaired_json = repair_json(result_no_think)
+            parsed_result = json.loads(repaired_json)
             
-            # 策略 C: 激进清理后提取
-            clean_result = re.sub(r"```(?:json)?\s*(.*?)\s*```", r"\1", preprocessed_result, flags=re.DOTALL)
-            if clean_result != preprocessed_result:
-                res = self.batch_rewrite_lines_from_clean(clean_result)
-                if res: return res
+            if isinstance(parsed_result, dict) and len(parsed_result) > 0:
+                return parsed_result
             
+            logger.warning(f"JSON 解析成功但格式不符合预期（非字典或为空）")
+        except Exception as e:
             # 记录失败详情
             self._log_failure(text_batch, str(e), result)
             logger.error(f"JSON解析最终失败，详情已记录至 rewrite_failures.log")
-            return None
-
-    def batch_rewrite_lines_from_clean(self, clean_text: str) -> Optional[Dict[str, str]]:
-        """从清洗后的文本中再次尝试解析"""
-        try:
-            return json.loads(clean_text)
-        except json.JSONDecodeError:
-            # 重复一次策略 B 的逻辑
-            brace_indices = [m.start() for m in re.finditer('{', clean_text)]
-            for idx in reversed(brace_indices):
-                try:
-                    decoder = json.JSONDecoder()
-                    obj, _ = decoder.raw_decode(clean_text[idx:])
-                    if isinstance(obj, dict): return obj
-                except: continue
+            
         return None
 
     @staticmethod
@@ -220,7 +169,7 @@ class FileTextProcessor:
         for fp in file_paths:
             try:
                 with open(fp, "r", encoding=self.config.file_encoding) as f:
-                    # 过滤逻辑：1. 非空 2. 单词数 > 1
+                    # 过滤逻辑：1. 非空 2. 单词数 > 2
                     lines = []
                     for line in f:
                         clean_line = line.strip()
