@@ -21,8 +21,6 @@
   <a href="#-faq">❓ FAQ</a>
 </p>
 
-> [中文说明](README.zh.md)
-
 ---
 
 ## 🤔 Still manually rewriting thousands of log messages?
@@ -224,3 +222,11 @@ Contributions of all forms are welcome — submit an Issue, a Pull Request, or h
 ## 📄 License
 
 MIT © [huajielong](https://github.com/huajielong)
+
+---
+
+<p align="center">
+  ⭐ If this tool helps you, please give it a Star!
+</p>
+
+> [中文说明](README.zh.md)
