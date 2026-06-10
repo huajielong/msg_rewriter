@@ -1,5 +1,3 @@
-> [🇨🇳 中文说明](README.zh.md)
-
 <p align="center">
   <img src="https://img.shields.io/badge/version-1.0.0-blue" alt="v1.0"/>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT"/>
@@ -22,6 +20,8 @@
   <a href="#-configuration-guide">⚙️ Configuration</a> •
   <a href="#-faq">❓ FAQ</a>
 </p>
+
+> [中文说明](README.zh.md)
 
 ---
 
